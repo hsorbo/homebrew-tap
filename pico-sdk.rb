@@ -22,7 +22,7 @@ class PicoSdk < Formula
       system "cmake", "--build", "."
       bin.install "elf2uf2"
     end
-    ["cmake", "docs", "external", "lib", "src", "test"].each do |n|
+    ["cmake", "docs", "external", "lib", "src", "test", "tools"].each do |n|
       (share/"pico-sdk").install "#{n}"
     end
     Dir.glob("*.*") do |n|
