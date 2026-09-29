@@ -1,0 +1,329 @@
+Port lowntfs-3g to the libfuse 3 API, for libfuse with the Fusetta mount
+backend (hsorbo/tap/libfuse) on macOS.
+
+- configure.ac: --with-fuse=external uses fuse3 >= 3.10.0.
+- src/Makefile.am: FUSE_USE_VERSION 31; only lowntfs-3g is built (ntfs-3g,
+  the high-level driver, is not ported).
+- src/lowntfs-3g.c: fuse_session_new/fuse_session_mount/_unmount, rename
+  flags (RENAME_NOREPLACE; RENAME_EXCHANGE is EINVAL), no macFUSE xattr
+  position/xtimes, and on macOS: no fuseblk, volname= from the NTFS label,
+  streams_interface=openxattr by default (as with user_xattr).
+
+diff --git a/configure.ac b/configure.ac
+index 96b5dac..4f697db 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -321,13 +321,13 @@ elif test "${with_fuse}" = "external"; then
+ 	export PKG_CONFIG_PATH=${PKG_CONFIG_PATH}:/lib/pkgconfig:/usr/lib/pkgconfig:/opt/gnome/lib/pkgconfig:/usr/share/pkgconfig:/usr/local/lib/pkgconfig:$prefix/lib/pkgconfig:/opt/gnome/share/pkgconfig:/usr/local/share/pkgconfig
+ 	PKG_CHECK_MODULES(
+ 		[FUSE_MODULE],
+-		[fuse >= 2.6.0],
++		[fuse3 >= 3.10.0],
+ 		,
+ 		[
+-			AC_MSG_ERROR([FUSE >= 2.6.0 was not found. Either older FUSE is still present, or FUSE is not fully installed (e.g. fuse, libfuse, libfuse2, libfuse-dev, etc packages). Source code: http://fuse.sf.net])
++			AC_MSG_ERROR([FUSE 3 >= 3.10.0 was not found (pkg-config fuse3).])
+ 		]
+ 	)
+-	FUSE_LIB_PATH=`$PKG_CONFIG --libs-only-L fuse | sed -e 's,/[/]*,/,g' -e 's,[ ]*$,,'`
++	FUSE_LIB_PATH=`$PKG_CONFIG --libs-only-L fuse3 | sed -e 's,/[/]*,/,g' -e 's,[ ]*$,,'`
+ fi
+ 
+ # Autodetect whether we can build crypto stuff or not.
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 8d98408..8a744c4 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -19,7 +19,7 @@ endif
+ if ENABLE_NTFS_3G
+ 
+ bin_PROGRAMS	 = ntfs-3g.probe
+-rootbin_PROGRAMS = ntfs-3g lowntfs-3g
++rootbin_PROGRAMS = lowntfs-3g
+ rootsbin_DATA 	 = #Create directory
+ man_MANS	 = ntfs-3g.8 ntfs-3g.probe.8
+ 
+@@ -29,7 +29,7 @@ ntfs_3g_LDFLAGS  = $(AM_LDFLAGS) -all-static
+ endif
+ ntfs_3g_CFLAGS   =			\
+ 	$(AM_CFLAGS) 			\
+-	-DFUSE_USE_VERSION=26 		\
++	-DFUSE_USE_VERSION=31 		\
+ 	$(FUSE_CFLAGS) 			\
+ 	-I$(top_srcdir)/include/ntfs-3g	\
+ 	$(PLUGIN_CFLAGS)
+@@ -41,7 +41,7 @@ lowntfs_3g_LDFLAGS  = $(AM_LDFLAGS) -all-static
+ endif
+ lowntfs_3g_CFLAGS   =			\
+ 	$(AM_CFLAGS) 			\
+-	-DFUSE_USE_VERSION=26 		\
++	-DFUSE_USE_VERSION=31 		\
+ 	$(FUSE_CFLAGS) 			\
+ 	-I$(top_srcdir)/include/ntfs-3g	\
+ 	$(PLUGIN_CFLAGS)
+@@ -54,7 +54,7 @@ endif
+ ntfs_3g_probe_CFLAGS  	= $(AM_CFLAGS) -I$(top_srcdir)/include/ntfs-3g
+ ntfs_3g_probe_SOURCES 	= ntfs-3g.probe.c
+ 
+-drivers : $(FUSE_LIBS) ntfs-3g lowntfs-3g
++drivers : $(FUSE_LIBS) lowntfs-3g
+ 
+ install-exec-hook:
+ if RUN_LDCONFIG
+diff --git a/src/lowntfs-3g.c b/src/lowntfs-3g.c
+index e4ff0bf..725c1db 100644
+--- a/src/lowntfs-3g.c
++++ b/src/lowntfs-3g.c
+@@ -86,6 +86,11 @@
+ #include <sys/param.h>
+ #endif /* defined(__APPLE__) || defined(__DARWIN__), ... */
+ 
++/* macFUSE passes a position to getxattr/setxattr, libfuse 3 does not */
++#if (defined(__APPLE__) || defined(__DARWIN__)) && FUSE_USE_VERSION < 30
++#define XATTR_POSITION 1
++#endif
++
+ #ifndef FUSE_CAP_POSIX_ACL  /* until defined in <fuse/fuse_common.h> */
+ #define FUSE_CAP_POSIX_ACL (1 << 18)
+ #endif /* FUSE_CAP_POSIX_ACL */
+@@ -620,7 +625,7 @@ int ntfs_macfuse_setchgtime(const char *path, const struct timespec *tv)
+ static void ntfs_init(void *userdata __attribute__((unused)),
+ 			struct fuse_conn_info *conn)
+ {
+-#if defined(__APPLE__) || defined(__DARWIN__)
++#ifdef FUSE_ENABLE_XTIMES
+ 	FUSE_ENABLE_XTIMES(conn);
+ #endif
+ #ifdef FUSE_CAP_DONT_MASK
+@@ -3005,9 +3010,15 @@ static int ntfs_fuse_rename_existing_dest(fuse_req_t req, fuse_ino_t ino,
+ 	return	ret;
+ }
+ 
++#if FUSE_USE_VERSION >= 30
++static void ntfs_fuse_rename(fuse_req_t req, fuse_ino_t parent,
++			const char *name, fuse_ino_t newparent,
++			const char *newname, unsigned int flags)
++#else
+ static void ntfs_fuse_rename(fuse_req_t req, fuse_ino_t parent,
+ 			const char *name, fuse_ino_t newparent,
+ 			const char *newname)
++#endif
+ {
+ 	int ret;
+ 	fuse_ino_t ino;
+@@ -3020,6 +3031,13 @@ static void ntfs_fuse_rename(fuse_req_t req, fuse_ino_t parent,
+ 	 *  FIXME: Rename should be atomic.
+ 	 */
+         
++#if FUSE_USE_VERSION >= 30
++	/* RENAME_NOREPLACE is 1, RENAME_EXCHANGE is not supported */
++	if (flags & ~1U) {
++		ret = -EINVAL;
++		goto out;
++	}
++#endif
+ 	ino = ntfs_fuse_inode_lookup(parent, name);
+ 	if (ino == (fuse_ino_t)-1) {
+ 		ret = -errno;
+@@ -3027,6 +3045,12 @@ static void ntfs_fuse_rename(fuse_req_t req, fuse_ino_t parent,
+ 	}
+ 	/* Check whether target is present */
+ 	xino = ntfs_fuse_inode_lookup(newparent, newname);
++#if FUSE_USE_VERSION >= 30
++	if ((xino != (fuse_ino_t)-1) && (flags & 1U)) {
++		ret = -EEXIST;
++		goto out;
++	}
++#endif
+ 	if (xino != (fuse_ino_t)-1) {
+ 			/*
+ 			 * Target exists : no need to check whether it
+@@ -3526,7 +3550,7 @@ out :
+ 	free(list);
+ }
+ 
+-#if defined(__APPLE__) || defined(__DARWIN__)
++#ifdef XATTR_POSITION
+ static void ntfs_fuse_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+ 			  size_t size, uint32_t position)
+ #else
+@@ -3534,7 +3558,7 @@ static void ntfs_fuse_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+ 			  size_t size)
+ #endif
+ {
+-#if !(defined(__APPLE__) || defined(__DARWIN__))
++#ifndef XATTR_POSITION
+ 	static const unsigned int position = 0U;
+ #endif
+ 
+@@ -3705,7 +3729,7 @@ out :
+ 	free(value);
+ }
+ 
+-#if defined(__APPLE__) || defined(__DARWIN__)
++#ifdef XATTR_POSITION
+ static void ntfs_fuse_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+ 			  const char *value, size_t size, int flags,
+ 			  uint32_t position)
+@@ -3714,9 +3738,10 @@ static void ntfs_fuse_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+ 			  const char *value, size_t size, int flags)
+ #endif
+ {
+-#if !(defined(__APPLE__) || defined(__DARWIN__))
++#ifndef XATTR_POSITION
+ 	static const unsigned int position = 0U;
+-#else
++#endif
++#if defined(__APPLE__) || defined(__DARWIN__)
+ 	BOOL is_resource_fork;
+ #endif
+ 
+@@ -4297,6 +4322,9 @@ static int ntfs_fuse_init(void)
+ 		.gid	 = getgid(),
+ #if defined(linux)		        
+ 		.streams = NF_STREAMS_INTERFACE_XATTR,
++#elif defined(__APPLE__) || defined(__DARWIN__)
++		/* as with user_xattr: macOS names, kept as named streams */
++		.streams = NF_STREAMS_INTERFACE_OPENXATTR,
+ #else		        
+ 		.streams = NF_STREAMS_INTERFACE_NONE,
+ #endif		        
+@@ -4494,6 +4522,8 @@ static fuse_fstype load_fuse_module(void)
+ 
+ #endif
+ 
++#if FUSE_USE_VERSION < 30
++
+ static struct fuse_chan *try_fuse_mount(char *parsed_options)
+ {
+ 	struct fuse_chan *fc = NULL;
+@@ -4513,6 +4543,8 @@ free_args:
+ 	return fc;
+ 	        
+ }
++
++#endif /* FUSE_USE_VERSION < 30 */
+ 	        
+ static int set_fuseblk_options(char **parsed_options)
+ {
+@@ -4533,6 +4565,43 @@ static int set_fuseblk_options(char **parsed_options)
+ 	return 0;
+ }
+ 
++#if FUSE_USE_VERSION >= 30
++
++static struct fuse_session *mount_fuse(char *parsed_options)
++{
++	struct fuse_session *se = NULL;
++	struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
++
++	if (fuse_opt_add_arg(&args, EXEC_NAME) == -1
++	    || fuse_opt_add_arg(&args, "-o") == -1
++	    || fuse_opt_add_arg(&args, parsed_options) == -1) {
++		ntfs_log_error("Failed to set FUSE options.\n");
++		goto out;
++	}
++	if (ctx->debug && fuse_opt_add_arg(&args, "-odebug") == -1)
++		goto out;
++
++	se = fuse_session_new(&args, &ntfs_3g_ops, sizeof(ntfs_3g_ops), NULL);
++	if (!se)
++		goto out;
++	if (fuse_set_signal_handlers(se))
++		goto err_destroy;
++	if (fuse_session_mount(se, opts.mnt_point))
++		goto err_signals;
++	ctx->fc = se;
++out:
++	fuse_opt_free_args(&args);
++	return se;
++err_signals:
++	fuse_remove_signal_handlers(se);
++err_destroy:
++	fuse_session_destroy(se);
++	se = NULL;
++	goto out;
++}
++
++#else /* FUSE_USE_VERSION >= 30 */
++
+ static struct fuse_session *mount_fuse(char *parsed_options)
+ {
+ 	struct fuse_session *se = NULL;
+@@ -4567,6 +4636,8 @@ err:
+ 	goto out;
+ }
+ 
++#endif /* FUSE_USE_VERSION >= 30 */
++
+ static void setup_logging(char *parsed_options)
+ {
+ 	if (!ctx->no_detach) {
+@@ -4711,7 +4782,8 @@ int main(int argc, char *argv[])
+ 		goto err_out;
+ 	}
+ 
+-#if !(defined(__sun) && defined (__SVR4))
++#if !(defined(__sun) && defined (__SVR4)) \
++	&& !(defined(__APPLE__) || defined(__DARWIN__))
+ 	/* Always use fuseblk for block devices unless it's surely missing. */
+ 	if (S_ISBLK(sbuf.st_mode) && (fstype != FSTYPE_FUSE))
+ 		ctx->blkdev = TRUE;
+@@ -4738,6 +4810,21 @@ int main(int argc, char *argv[])
+ 	} else
+ 		if (ctx->rw && ntfs_strinsert(&parsed_options, ",rw"))
+ 			goto err_out;
++#if defined(__APPLE__) || defined(__DARWIN__)
++	/* Name the volume after the NTFS label unless volname= was given */
++	if (!strstr(parsed_options, "volname=")
++	    && ctx->vol->vol_name && ctx->vol->vol_name[0]) {
++		char *volname = NULL;
++
++		if (ntfs_strappend(&volname, ",volname=")
++		    || ntfs_strappend_escaped(&volname, ctx->vol->vol_name)
++		    || ntfs_strinsert(&parsed_options, volname)) {
++			free(volname);
++			goto err_out;
++		}
++		free(volname);
++	}
++#endif
+ 	/* We must do this after ntfs_open() to be able to set the blksize */
+ 	if (ctx->blkdev && set_fuseblk_options(&parsed_options))
+ 		goto err_out;
+@@ -4851,7 +4938,11 @@ int main(int argc, char *argv[])
+         
+ 	err = 0;
+ 
++#if FUSE_USE_VERSION >= 30
++	fuse_session_unmount(se);
++#else
+ 	fuse_unmount(opts.mnt_point, ctx->fc);
++#endif
+ 	fuse_session_destroy(se);
+ err_out:
+ 	ntfs_mount_error(opts.device, opts.mnt_point, err);
+diff --git a/src/ntfs-3g_common.h b/src/ntfs-3g_common.h
+index 8ead510..79da29b 100644
+--- a/src/ntfs-3g_common.h
++++ b/src/ntfs-3g_common.h
+@@ -165,7 +165,11 @@ typedef struct {
+ 	char *xattrmap_path;
+ #endif /* XATTR_MAPPINGS */
+ #endif /* HAVE_SETXATTR */
++#if FUSE_USE_VERSION >= 30
++	struct fuse_session *fc;
++#else
+ 	struct fuse_chan *fc;
++#endif
+ 	BOOL inherit;
+ 	unsigned int secure_flags;
+ 	single_log_t errors_logged;
+@@ -200,6 +204,7 @@ extern const char nf_ns_trusted_prefix[];
+ extern const int nf_ns_trusted_prefix_len;
+ 
+ int ntfs_strappend(char **dest, const char *append);
++int ntfs_strappend_escaped(char **dest, const char *append);
+ int ntfs_strinsert(char **dest, const char *append);
+ char *parse_mount_options(ntfs_fuse_context_t *ctx,
+ 			const struct ntfs_options *popts, BOOL low_fuse);
